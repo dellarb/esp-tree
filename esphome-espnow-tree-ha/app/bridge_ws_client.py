@@ -6,6 +6,7 @@ import hmac
 import json
 import logging
 import os
+import time
 from typing import Any, Callable, Optional
 
 import websockets
@@ -23,6 +24,10 @@ WS_PATH = "/espnow-tree/v1/ws"
 
 BACKOFF_DELAYS = [1, 2, 5, 10]
 HEARTBEAT_TIMEOUT_S = 90
+
+
+def _mac_key(value: str) -> str:
+    return normalize_mac(value).replace(":", "").upper()
 
 
 class BridgeWsClient:
@@ -183,10 +188,10 @@ class BridgeWsClient:
             async with websockets.connect(url, max_size=65536, ping_interval=30, ping_timeout=10, close_timeout=5) as ws:
                 self._ws = ws
                 self._connected = True
-                self._notify_connection_change(True)
                 try:
                     await self._do_auth(ws)
                     self._reset_backoff()
+                    self._notify_connection_change(True)
                     logger.info("bridge ws authenticated")
                     await self._message_loop(ws)
                 except Exception as exc:
@@ -263,16 +268,31 @@ class BridgeWsClient:
         envelope: dict[str, Any] = {"v": API_VERSION, "id": request_id, "type": "topology.get"}
         if payload:
             envelope["payload"] = payload
-        future: asyncio.Future[dict[str, Any]] = asyncio.get_event_loop().create_future()
-        self._pending_requests[request_id] = future
         await ws.send(json.dumps(envelope))
-        try:
-            return await asyncio.wait_for(future, timeout=15.0)
-        except asyncio.TimeoutError:
-            logger.warning("bridge ws topology.get timed out")
-            return None
-        finally:
-            self._pending_requests.pop(request_id, None)
+        logger.debug("bridge ws topology.get sent, waiting for response id=%s", request_id)
+        deadline = asyncio.get_event_loop().time() + 15.0
+        while asyncio.get_event_loop().time() < deadline:
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                break
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=min(remaining, 2.0))
+            except asyncio.TimeoutError:
+                continue
+            if isinstance(raw, bytes):
+                continue
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if msg.get("id") == request_id:
+                return msg
+            msg_type = msg.get("type", "")
+            if msg_type == "bridge.heartbeat":
+                continue
+            logger.debug("bridge ws auth-phase unhandled message: %s", msg_type)
+        logger.warning("bridge ws topology.get timed out")
+        return None
 
     async def _message_loop(self, ws: websockets.client.WebSocketClientProtocol) -> None:
         last_rx_time = asyncio.get_event_loop().time()
@@ -397,12 +417,15 @@ class BridgeWsManager:
         self.settings = settings
         self._db = db
         self._client: Optional[BridgeWsClient] = None
+        self._target: Optional[BridgeTarget] = None
         self._topology_cache: Optional[dict[str, Any]] = None
+        self._topology_cache_ts = 0.0
 
     def is_ws_mode(self) -> bool:
         return self.settings.bridge_transport == "ws"
 
     def start(self, target: BridgeTarget) -> BridgeWsClient:
+        self._target = target
         client = BridgeWsClient(
             target=target,
             api_key=self.settings.bridge_api_key,
@@ -413,6 +436,9 @@ class BridgeWsManager:
         self._client = client
         client.start()
         return client
+
+    def set_target(self, target: BridgeTarget) -> None:
+        self._target = target
 
     async def stop(self) -> None:
         if self._client:
@@ -427,34 +453,105 @@ class BridgeWsManager:
     def connected(self) -> bool:
         return self._client.connected if self._client else False
 
+    async def topology(self, max_age_s: float = 4.0) -> list[dict[str, Any]]:
+        if self._topology_cache and time.monotonic() - self._topology_cache_ts < max_age_s:
+            return self.get_topology_list()
+        if self.connected and self._client:
+            await self._client.get_topology()
+            return self.get_topology_list()
+        await self.refresh_once()
+        return self.get_topology_list()
+
+    async def refresh_once(self) -> dict[str, Any]:
+        if not self._target:
+            raise RuntimeError("WebSocket bridge target is not configured")
+        client = BridgeWsClient(
+            target=self._target,
+            api_key=self.settings.bridge_api_key,
+            on_topology=self._on_topology,
+            on_event=self._on_event,
+            on_connection_change=None,
+        )
+        url = client.ws_url()
+        logger.info("bridge ws one-shot topology request to %s", url)
+        async with websockets.connect(url, max_size=65536, ping_interval=None, close_timeout=2) as ws:
+            client._ws = ws
+            client._connected = True
+            await client._do_auth(ws)
+        if not self._topology_cache:
+            raise RuntimeError("bridge returned no topology snapshot")
+        return self._topology_cache
+
     def get_topology_list(self) -> list[dict[str, Any]]:
         if not self._topology_cache:
             return []
         nodes = self._topology_cache.get("nodes", [])
         result = []
+        bridge = self._topology_cache.get("bridge", {})
+        if bridge:
+            bridge_mac = bridge.get("mac", "")
+            bridge_mac_key = _mac_key(bridge_mac)
+            bridge_name = bridge.get("name", "")
+            bridge_esphome_name = bridge.get("esphome_name") or bridge_name
+            bridge_label = bridge.get("label") or bridge.get("friendly_name") or bridge_name
+            result.append({
+                "mac": bridge_mac,
+                "node_key": bridge_mac_key,
+                "device_unique_id": bridge.get("device_unique_id") or ("espnow_lr_" + bridge_mac_key),
+                "parent_mac": "",
+                "name": bridge_name,
+                "esphome_name": bridge_esphome_name,
+                "friendly_name": bridge_label,
+                "label": bridge_label,
+                "manufacturer": bridge.get("manufacturer", "ESPHome"),
+                "model": bridge.get("model", "espnow_lr_bridge"),
+                "sw_version": bridge.get("software_version") or bridge.get("firmware", {}).get("version") or bridge.get("firmware_version", ""),
+                "project_name": bridge.get("project_name", ""),
+                "firmware_version": bridge.get("firmware_version") or bridge.get("firmware", {}).get("version", ""),
+                "firmware_build_date": bridge.get("firmware", {}).get("build_date", ""),
+                "online": True,
+                "chip_name": bridge.get("chip_name") or bridge.get("chip_model"),
+                "rssi": bridge.get("radio", {}).get("rssi"),
+                "hops": 0,
+                "uptime_s": bridge.get("uptime_s"),
+                "offline_s": 0,
+                "entity_count": bridge.get("entity_count"),
+                "route_v2_capable": True,
+                "from_ws_api": True,
+                "is_bridge": True,
+            })
         for node in nodes:
+            identity = node.get("identity", {})
+            radio = node.get("radio", {})
+            session = node.get("session", {})
+            schema = node.get("schema")
+            parent_mac = node.get("parent_mac") or radio.get("parent_mac") or ""
+            hops = radio.get("hops_to_bridge", node.get("hop_count"))
             entry: dict[str, Any] = {
                 "mac": node.get("mac", ""),
                 "node_key": node.get("node_key", ""),
                 "device_unique_id": node.get("device_unique_id", ""),
-                "name": node.get("name") or node.get("identity", {}).get("esphome_name", ""),
-                "esphome_name": node.get("identity", {}).get("esphome_name") or node.get("name", ""),
-                "friendly_name": node.get("friendly_name") or node.get("identity", {}).get("node_label", ""),
-                "label": node.get("friendly_name") or node.get("name") or node.get("identity", {}).get("node_label", ""),
-                "manufacturer": node.get("identity", {}).get("manufacturer", "ESPHome"),
-                "model": node.get("identity", {}).get("model", "espnow_lr_remote"),
-                "sw_version": node.get("identity", {}).get("project_version") or node.get("software_version", ""),
-                "project_name": node.get("identity", {}).get("project_name", ""),
-                "firmware_version": node.get("identity", {}).get("project_version") or node.get("sw_version", ""),
-                "firmware_build_date": node.get("identity", {}).get("build_date", ""),
+                "parent_mac": parent_mac,
+                "name": node.get("name") or identity.get("esphome_name", ""),
+                "esphome_name": identity.get("esphome_name") or node.get("name", ""),
+                "friendly_name": node.get("friendly_name") or identity.get("node_label", ""),
+                "label": node.get("friendly_name") or node.get("name") or identity.get("node_label", ""),
+                "manufacturer": identity.get("manufacturer", "ESPHome"),
+                "model": identity.get("model", "espnow_lr_remote"),
+                "sw_version": identity.get("project_version") or node.get("sw_version", ""),
+                "project_name": identity.get("project_name", ""),
+                "firmware_version": identity.get("project_version") or node.get("sw_version", ""),
+                "firmware_build_date": identity.get("build_date", ""),
                 "online": node.get("online", False),
-                "chip_name": node.get("identity", {}).get("chip_model"),
-                "rssi": node.get("radio", {}).get("rssi"),
-                "hops": node.get("radio", {}).get("hops_to_bridge"),
-                "entity_count": node.get("schema", {}).get("total_entities") if node.get("schema") else None,
+                "chip_name": node.get("chip_name") or identity.get("chip_model"),
+                "rssi": radio.get("rssi", node.get("rssi")),
+                "hops": hops,
+                "uptime_s": node.get("uptime_s", 0),
+                "offline_s": node.get("offline_s", 0),
+                "route_v2_capable": session.get("route_v2_capable", node.get("route_v2_capable", False)),
+                "entity_count": schema.get("total_entities") if isinstance(schema, dict) else None,
                 "from_ws_api": True,
             }
-            schema = node.get("schema")
             if schema and isinstance(schema, dict) and schema.get("entities"):
                 entry["entities"] = schema["entities"]
                 entry["entity_count"] = len(schema["entities"])
@@ -466,6 +563,7 @@ class BridgeWsManager:
 
     def _on_topology(self, snapshot: dict[str, Any]) -> None:
         self._topology_cache = snapshot
+        self._topology_cache_ts = time.monotonic()
         logger.info("bridge ws topology updated: %d nodes", len(snapshot.get("nodes", [])))
         if self._db:
             try:
