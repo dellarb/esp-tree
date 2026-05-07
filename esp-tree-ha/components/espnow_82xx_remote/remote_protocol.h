@@ -1,9 +1,9 @@
 #pragma once
 
 #include "remote_file_receiver.h"
-#include "espnow_lr_common/espnow_crypto.h"
-#include "espnow_lr_common/espnow_types.h"
-#include "espnow_lr_common/espnow_mac_utils.h"
+#include "esp_tree_common/espnow_crypto.h"
+#include "esp_tree_common/espnow_types.h"
+#include "esp_tree_common/espnow_mac_utils.h"
 
 #include <array>
 #include <atomic>
@@ -15,7 +15,7 @@
 #include <vector>
 
 namespace esphome {
-namespace espnow_lr {
+namespace esp_tree {
 
 using RemoteEntitySchema = espnow_entity_schema_t;
 
@@ -333,5 +333,5 @@ class RemoteProtocol {
   }
 };
 
-}  // namespace espnow_lr
+}  // namespace esp_tree
 }  // namespace esphome

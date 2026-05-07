@@ -19,7 +19,7 @@ from esphome.components import alarm_control_panel as alarm_control_panel_compon
 from esphome.components import switch as switch_component
 
 CODEOWNERS = ["@esphome"]
-AUTO_LOAD = ["espnow_lr_common"]
+AUTO_LOAD = ["esp_tree_common"]
 
 CONF_NETWORK_ID = "network_id"
 CONF_PSK = "psk"
@@ -31,7 +31,7 @@ CONF_PREFERRED_PARENTS = "preferred_parents"
 CONF_OTA_OVER_ESPNOW = "ota_over_espnow"
 CONF_CHANNEL = "channel"
 
-espnow_ns = cg.esphome_ns.namespace("espnow_lr")
+espnow_ns = cg.esphome_ns.namespace("esp_tree")
 ESPNow82xxRemote = espnow_ns.class_("ESPNow82xxRemote", cg.Component)
 
 CONFIG_SCHEMA = cv.Schema(

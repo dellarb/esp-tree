@@ -26,7 +26,7 @@
 
 // TODO: HMAC-SHA256 for ESP8266 — this file references mbedtls/OpenSSL only
 // for the static sha256_bytes() helper. The actual HMAC-SHA256 path used by
-// the crypto layer lives in espnow_lr_common/espnow_crypto.cpp. If a platform-
+// the crypto layer lives in esp_tree_common/espnow_crypto.cpp. If a platform-
 // specific SHA-256 is needed here, guard accordingly.
 #if defined(ARDUINO_ARCH_ESP8266)
 // ESP8266 SHA-256 via BearSSL (bundled with Arduino-ESP8266)
@@ -38,7 +38,7 @@
 #endif
 
 namespace esphome {
-namespace espnow_lr {
+namespace esp_tree {
 
 static const char *const TAG = "espnow";
 static const char *const COLOR_RED    = "\x1b[31m";
@@ -2534,5 +2534,5 @@ void RemoteProtocol::compute_schema_hash_(uint8_t out_hash[32]) const {
   sha256_bytes(bytes.data(), bytes.size(), out_hash);
 }
 
-}  // namespace espnow_lr
+}  // namespace esp_tree
 }  // namespace esphome

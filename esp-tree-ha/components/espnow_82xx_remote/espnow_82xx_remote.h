@@ -74,7 +74,7 @@ struct PermutationEntry {
 #endif
 
 namespace esphome {
-namespace espnow_lr {
+namespace esp_tree {
 
 class ESPNow82xxRemote : public Component {
  public:
@@ -333,5 +333,5 @@ class ESPNow82xxRemote : public Component {
   static ESPNow82xxRemote *active_instance_;
 };
 
-}  // namespace espnow_lr
+}  // namespace esp_tree
 }  // namespace esphome
